@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -40,6 +41,13 @@ CLIENT_FIELDS = {
 }
 CONNECTION_FIELDS = CLIENT_FIELDS | {"enabled"}
 
+# API 密钥不再写入 model.json，只保存环境变量名；密钥本身来自进程环境变量
+# 或工作区 .env 文件。见 ENV_NAME_PATTERN、load_workspace_env()。
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DEFAULT_API_KEY_ENV = "NOVEL_API_KEY"
+ENV_VAR_PREFIX = "NOVEL_API_KEY_"
+ENV_FALLBACK_NAMES = ("NOVEL_API_KEY", "OPENAI_API_KEY")
+
 
 @dataclass(slots=True)
 class ModelSettings:
@@ -50,6 +58,7 @@ class ModelSettings:
     temperature: float = 0.4
     timeout_seconds: int = 180
     api_key: str = ""
+    api_key_env: str = ""
     top_p: float | None = None
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
@@ -67,6 +76,167 @@ class ModelSettings:
     last_test_message: str = ""
 
 
+_ENV_FILE_CACHE: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
+_ENV_FILE_CACHE_LOCK = threading.Lock()
+
+
+def env_var_name_for(model_id: str) -> str:
+    """Derive a stable, collision-free environment variable name for a model."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(model_id or "")).strip("_").upper()
+    if not cleaned:
+        return DEFAULT_API_KEY_ENV
+    return f"{ENV_VAR_PREFIX}{cleaned}"
+
+
+def workspace_env_path(workspace: str | Path) -> Path:
+    return Path(workspace).resolve() / ".env"
+
+
+def _unescape_env_value(value: str) -> str:
+    if "\\" not in value:
+        return value
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            result.append(value[index + 1])
+            index += 2
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def read_env_file(path: str | Path) -> dict[str, str]:
+    """Parse a dotenv-style file. Missing or unreadable files yield an empty map."""
+    target = Path(path)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return {}
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        name, separator, raw = stripped.partition("=")
+        name = name.strip()
+        if not separator or not ENV_NAME_PATTERN.match(name):
+            continue
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+            if value:
+                value = _unescape_env_value(value)
+        values[name] = value
+    return values
+
+
+def _read_env_file_cached(path: str | Path) -> dict[str, str]:
+    target = Path(path)
+    try:
+        stat = target.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = (0, 0)
+    key = str(target)
+    with _ENV_FILE_CACHE_LOCK:
+        cached = _ENV_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+    values = read_env_file(target)
+    with _ENV_FILE_CACHE_LOCK:
+        _ENV_FILE_CACHE[key] = (stamp, values)
+    return values
+
+
+def _invalidate_env_cache(path: str | Path) -> None:
+    with _ENV_FILE_CACHE_LOCK:
+        _ENV_FILE_CACHE.pop(str(Path(path)), None)
+
+
+def _format_env_value(value: str) -> str:
+    text = str(value)
+    if text == text.strip() and not any(character in text for character in ' #"\''):
+        return text
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def write_env_values(path: str | Path, updates: dict[str, str | None]) -> None:
+    """Update or remove keys in a dotenv file, preserving comments and other lines.
+
+    A ``None`` value removes the entry.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    remaining = dict(updates)
+    result: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        candidate = (
+            stripped[len("export ") :].lstrip()
+            if stripped.startswith("export ")
+            else stripped
+        )
+        name, separator, _ = candidate.partition("=")
+        name = name.strip()
+        if separator and ENV_NAME_PATTERN.match(name) and name in remaining:
+            value = remaining.pop(name)
+            if value is None:
+                continue
+            result.append(f"{name}={_format_env_value(value)}")
+            continue
+        result.append(line)
+    for name, value in remaining.items():
+        if value is None:
+            continue
+        result.append(f"{name}={_format_env_value(value)}")
+    text = "\n".join(result).rstrip("\n") + "\n"
+    fd, temp_name = tempfile.mkstemp(prefix=".env.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        _invalidate_env_cache(target)
+
+
+def load_workspace_env(workspace: str | Path) -> dict[str, str]:
+    """Load ``<workspace>/.env`` into the process environment.
+
+    Real environment variables always win: existing names are never overwritten.
+    """
+    applied: dict[str, str] = {}
+    for name, value in _read_env_file_cached(workspace_env_path(workspace)).items():
+        if not value or os.environ.get(name):
+            continue
+        os.environ[name] = value
+        applied[name] = value
+    return applied
+
+
 class ModelSettingsStore:
     """Versioned local model registry with a legacy single-model facade."""
 
@@ -74,6 +244,7 @@ class ModelSettingsStore:
         self.workspace = Path(workspace).resolve()
         self.local_dir = self.workspace / ".novel_agents"
         self.path = self.local_dir / "model.json"
+        self.env_path = workspace_env_path(self.workspace)
         self._lock = threading.RLock()
 
     def load(self) -> ModelSettings:
@@ -119,6 +290,7 @@ class ModelSettingsStore:
                 {**values, "id": model_id},
             )
             self._assert_unique_display_name(registry, profile.display_name)
+            self._store_api_key(profile, values)
 
             models: list[ModelSettings] = registry["models"]
             virtual_default = (
@@ -146,12 +318,13 @@ class ModelSettingsStore:
             )
             if current.id == registry["active_model_id"] and not updated.enabled:
                 raise ValueError("默认模型不能停用，请先选择其他默认模型")
+            self._store_api_key(updated, values)
 
             changed_connection = any(
                 field_name in values
                 for field_name in CONNECTION_FIELDS
                 if field_name != "enabled"
-            ) or values.get("clear_api_key") is True
+            ) or values.get("clear_api_key") is True or "api_key_env" in values
             if changed_connection:
                 updated.last_tested_at = ""
                 updated.last_test_ok = None
@@ -184,8 +357,8 @@ class ModelSettingsStore:
                 raise ValueError("已停用的模型不能设为默认模型")
             if not profile.model:
                 raise ValueError("模型名称不能为空")
-            if not profile.api_key:
-                raise ValueError("该模型尚未配置 API 密钥")
+            if not self._resolve_api_key(profile)[0]:
+                raise ValueError(self._missing_key_message(profile))
             registry["active_model_id"] = profile.id
             self._write_registry(registry)
             return self._public_profile(profile, profile.id)
@@ -267,8 +440,12 @@ class ModelSettingsStore:
             for key, value in override_values.items():
                 if key in values and value is not None:
                     values[key] = value
+            # 密钥优先取环境变量，其次工作区 .env，最后才回退到注册表内的旧值；
+            # 调用方显式传入的密钥仍然优先，便于“测试尚未保存的连接”。
+            if not values.get("api_key"):
+                values["api_key"] = self._resolve_api_key(settings)[0]
             if not values["api_key"]:
-                raise ValueError("尚未配置 API 密钥")
+                raise ValueError(self._missing_key_message(settings))
             if not values["model"]:
                 raise ValueError("尚未配置模型名称")
             return OpenAICompatibleClient(
@@ -307,11 +484,14 @@ class ModelSettingsStore:
             active_id = str(data.get("active_model_id", ""))
             if not any(profile.id == active_id for profile in profiles):
                 active_id = profiles[0].id
-            return {
+            registry = {
                 "version": REGISTRY_VERSION,
                 "active_model_id": active_id,
                 "models": profiles,
             }
+            if self._migrate_plaintext_keys(registry):
+                self._write_registry(registry)
+            return registry
 
         profile = self._legacy_profile(data)
         registry = {
@@ -319,6 +499,7 @@ class ModelSettingsStore:
             "active_model_id": profile.id,
             "models": [profile],
         }
+        self._migrate_plaintext_keys(registry)
         self._write_registry(registry)
         return registry
 
@@ -332,9 +513,10 @@ class ModelSettingsStore:
             ).rstrip("/"),
             model=model,
             temperature=float(os.getenv("NOVEL_TEMPERATURE", "0.4")),
-            api_key=str(
-                os.getenv("NOVEL_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-            ),
+            # 没有 model.json 时完全依赖环境变量，注册表内不保存密钥。
+            # 初始不绑定专属变量名，NOVEL_API_KEY / OPENAI_API_KEY 作为兜底生效。
+            api_key="",
+            api_key_env="",
         )
         return {
             "version": REGISTRY_VERSION,
@@ -344,6 +526,7 @@ class ModelSettingsStore:
 
     def _legacy_profile(self, data: dict[str, Any]) -> ModelSettings:
         model = str(data.get("model") or os.getenv("NOVEL_MODEL") or "")
+        stored_key = str(data.get("api_key") or "")
         legacy = dict(data)
         legacy.update(
             {
@@ -358,12 +541,10 @@ class ModelSettingsStore:
                 "temperature": data.get(
                     "temperature", os.getenv("NOVEL_TEMPERATURE", "0.4")
                 ),
-                "api_key": str(
-                    data.get("api_key")
-                    or os.getenv("NOVEL_API_KEY")
-                    or os.getenv("OPENAI_API_KEY")
-                    or ""
-                ),
+                # 文件里的旧密钥由 _migrate_plaintext_keys 搬进 .env；文件里没有
+                # 密钥时保持未绑定，交由 NOVEL_API_KEY / OPENAI_API_KEY 兜底。
+                "api_key": stored_key,
+                "api_key_env": "",
             }
         )
         return self._profile_from_data(legacy)
@@ -381,6 +562,7 @@ class ModelSettingsStore:
             temperature=float(data.get("temperature", 0.4)),
             timeout_seconds=int(data.get("timeout_seconds", 180)),
             api_key=str(data.get("api_key") or ""),
+            api_key_env=str(data.get("api_key_env") or "").strip(),
             top_p=_optional_float(data.get("top_p")),
             frequency_penalty=_optional_float(data.get("frequency_penalty")),
             presence_penalty=_optional_float(data.get("presence_penalty")),
@@ -431,6 +613,7 @@ class ModelSettingsStore:
 
         base["id"] = current.id if current else str(values.get("id") or "")
         base["display_name"] = str(base.get("display_name") or base.get("model") or "").strip()
+        base["api_key_env"] = str(base.get("api_key_env") or "").strip()
         base["base_url"] = _normalize_base_url(str(base.get("base_url") or ""))
         base["model"] = str(base.get("model") or "").strip()
         base["temperature"] = float(base.get("temperature", 0.4))
@@ -478,6 +661,10 @@ class ModelSettingsStore:
             raise ValueError("显示名称不能为空")
         if len(settings.display_name) > 80:
             raise ValueError("显示名称不能超过 80 个字符")
+        if settings.api_key_env and not ENV_NAME_PATTERN.match(settings.api_key_env):
+            raise ValueError(
+                "API 密钥的环境变量名只能包含字母、数字和下划线，且不能以数字开头"
+            )
         parsed = urlparse(settings.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("API 地址必须是有效的 http 或 https 地址")
@@ -513,11 +700,94 @@ class ModelSettingsStore:
                 return profile
         raise ValueError("模型配置不存在")
 
-    @staticmethod
-    def _public_profile(profile: ModelSettings, active_id: str) -> dict[str, Any]:
+    def _resolve_api_key(self, profile: ModelSettings) -> tuple[str, str]:
+        """Return ``(key, source)`` for a profile without ever exposing the key.
+
+        Precedence: the model's own environment variable (process env, then the
+        workspace ``.env``) → the generic ``NOVEL_API_KEY`` / ``OPENAI_API_KEY``
+        fallback → a legacy value still stored in the registry before migration.
+        """
+        name = profile.api_key_env
+        if name:
+            from_environment = str(os.environ.get(name) or "").strip()
+            if from_environment:
+                return from_environment, "env"
+            from_file = str(self._env_values().get(name) or "").strip()
+            if from_file:
+                return from_file, "dotenv"
+        for fallback in ENV_FALLBACK_NAMES:
+            from_environment = str(os.environ.get(fallback) or "").strip()
+            if from_environment:
+                return from_environment, "env-fallback"
+            from_file = str(self._env_values().get(fallback) or "").strip()
+            if from_file:
+                return from_file, "dotenv-fallback"
+        legacy = profile.api_key.strip()
+        if legacy:
+            return legacy, "registry"
+        return "", ""
+
+    def _env_values(self) -> dict[str, str]:
+        return _read_env_file_cached(self.env_path)
+
+    def _validate_env_name(self, name: str) -> str:
+        cleaned = str(name or "").strip()
+        if cleaned and not ENV_NAME_PATTERN.match(cleaned):
+            raise ValueError(
+                "API 密钥的环境变量名只能包含字母、数字和下划线，且不能以数字开头"
+            )
+        return cleaned
+
+    def _missing_key_message(self, profile: ModelSettings) -> str:
+        name = profile.api_key_env or env_var_name_for(profile.id)
+        fallback = " / ".join(ENV_FALLBACK_NAMES)
+        return (
+            f"模型「{profile.display_name}」尚未配置 API 密钥：请设置环境变量 {name}，"
+            f"或在 {self.env_path.name} 中定义 {name}（通用兜底变量：{fallback}）"
+        )
+
+    def _store_api_key(self, profile: ModelSettings, values: dict[str, Any]) -> None:
+        """Move a submitted secret out of the registry and into the environment file.
+
+        ``model.json`` only ever keeps the environment variable *name*.
+        """
+        requested = self._validate_env_name(str(values.get("api_key_env", "") or ""))
+        if requested:
+            profile.api_key_env = requested
+        if values.get("clear_api_key") is True:
+            if profile.api_key_env:
+                write_env_values(self.env_path, {profile.api_key_env: None})
+            profile.api_key = ""
+            return
+        supplied = str(values.get("api_key", "") or "").strip()
+        if not supplied:
+            return
+        if not profile.api_key_env:
+            profile.api_key_env = env_var_name_for(profile.id)
+        write_env_values(self.env_path, {profile.api_key_env: supplied})
+        profile.api_key = ""
+
+    def _migrate_plaintext_keys(self, registry: dict[str, Any]) -> bool:
+        """Move any plaintext key out of ``model.json`` into the workspace ``.env``."""
+        updates: dict[str, str | None] = {}
+        for profile in registry["models"]:
+            legacy = profile.api_key.strip()
+            if not legacy:
+                continue
+            if not profile.api_key_env:
+                profile.api_key_env = env_var_name_for(profile.id)
+            updates[profile.api_key_env] = legacy
+            profile.api_key = ""
+        if not updates:
+            return False
+        write_env_values(self.env_path, updates)
+        return True
+
+    def _public_profile(self, profile: ModelSettings, active_id: str) -> dict[str, Any]:
+        resolved, source = self._resolve_api_key(profile)
         hint = ""
-        if profile.api_key:
-            suffix = profile.api_key[-4:] if len(profile.api_key) >= 4 else "****"
+        if resolved:
+            suffix = resolved[-4:] if len(resolved) >= 4 else "****"
             hint = f"****{suffix}"
         return {
             "id": profile.id,
@@ -526,8 +796,10 @@ class ModelSettingsStore:
             "model": profile.model,
             "temperature": profile.temperature,
             "timeout_seconds": profile.timeout_seconds,
-            "has_api_key": bool(profile.api_key),
+            "has_api_key": bool(resolved),
             "api_key_hint": hint,
+            "api_key_env": profile.api_key_env,
+            "api_key_source": source or None,
             "top_p": profile.top_p,
             "frequency_penalty": profile.frequency_penalty,
             "presence_penalty": profile.presence_penalty,

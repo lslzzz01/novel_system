@@ -9,6 +9,7 @@ from typing import Sequence
 from .artifacts import ArtifactStore
 from .llm import MockLanguageModel, OpenAICompatibleClient
 from .models import ProjectBrief
+from .settings import load_workspace_env
 from .workflow import NovelWorkflow
 
 
@@ -111,7 +112,8 @@ def _build_model(args: argparse.Namespace):
     api_key = os.getenv("NOVEL_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError(
-            "Set NOVEL_API_KEY (or OPENAI_API_KEY), or pass --mock to verify locally."
+            "Set NOVEL_API_KEY (or OPENAI_API_KEY) in the environment or in .env, "
+            "or pass --mock to verify locally."
         )
     if not args.model:
         raise ValueError("Set NOVEL_MODEL or pass --model.")
@@ -128,6 +130,8 @@ def _build_model(args: argparse.Namespace):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # 模型密钥来自环境变量，<cwd>/.env 是它的本地文件形式。
+    load_workspace_env(Path.cwd())
     try:
         if args.command == "init":
             brief = ProjectBrief(
