@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "frontend-design": {
+      "source": "modelscope.cn",
+      "sourceUrl": "https://www.modelscope.cn/skills/@anthropics/frontend-design",
+      "sourceType": "well-known",
+      "computedHash": "3e0be122a3db8206b6d0d6b07cca898b5c75fb9b7b2101abe143fb2851734d2e",
+      "wellKnownDigest": "sha256:bb4b5dd42d615dc6cef71bf709a483612e6b683e62b8121b398285e220cae004"
+    }
+  }
+}

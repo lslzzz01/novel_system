@@ -1,0 +1,1 @@
+@powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:NOVEL_AGENTS_WORKSPACE='%~dp0'; & ([scriptblock]::Create((Get-Content -Raw -Encoding UTF8 '%~dp0NovelAgents-Control.ps1'))) %*" & if errorlevel 1 pause

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-agents"
+version = "0.1.0"
+description = "A required-agent workflow for planning and drafting novels."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+memory = [
+  "numpy>=1.26",
+  "onnxruntime>=1.17",
+  "sentence-transformers>=4.1",
+  "optimum[onnxruntime]>=1.20",
+]
+
+[project.scripts]
+novel-agents = "novel_agents.cli:main"
+novel-agents-web = "novel_agents.web:main"
+
+[tool.setuptools.packages.find]
+include = ["novel_agents*"]
+
+[tool.setuptools.package-data]
+novel_agents = ["web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]

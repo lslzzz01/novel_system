@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Novel Agents project ---
+.novel_agents/
+projects/
+node_modules/
+.pytest_cache/
+.hermes/
+.agents/
+
