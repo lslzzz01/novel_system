@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -18,7 +19,7 @@ from novel_agents.chapter_versions import ChapterVersionStore
 from novel_agents.memory_store import MemoryStore
 from novel_agents.settings import ModelSettingsStore
 from novel_agents.vector_index import NumpyVectorIndex
-from novel_agents.web import AppContext, make_handler
+from novel_agents.web import AppContext, JobManager, make_handler
 
 import numpy as np
 
@@ -73,6 +74,106 @@ class LocalConfigurationTests(unittest.TestCase):
             self.assertEqual("legacy-model", registry["models"][0]["model"])
             self.assertEqual("****5678", registry["models"][0]["api_key_hint"])
             self.assertNotIn("legacy-secret-5678", json.dumps(registry))
+
+    def test_api_key_is_never_persisted_to_model_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            store = ModelSettingsStore(workspace)
+            public = store.update(
+                {
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                    "api_key": "secret-value-1234",
+                }
+            )
+
+            self.assertTrue(public["has_api_key"])
+            self.assertEqual("****1234", public["api_key_hint"])
+            self.assertEqual("NOVEL_API_KEY_DEFAULT", public["api_key_env"])
+
+            registry_text = (workspace / ".novel_agents" / "model.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("secret-value-1234", registry_text)
+            self.assertEqual("", json.loads(registry_text)["models"][0]["api_key"])
+            self.assertIn(
+                "NOVEL_API_KEY_DEFAULT=secret-value-1234",
+                (workspace / ".env").read_text(encoding="utf-8"),
+            )
+
+            # 密钥只存在于环境文件中，同一工作区的新实例仍能取到。
+            self.assertEqual("secret-value-1234", store.create_client().api_key)
+            self.assertEqual(
+                "secret-value-1234",
+                ModelSettingsStore(workspace).create_client().api_key,
+            )
+
+    def test_environment_variable_wins_over_the_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ModelSettingsStore(temp_dir)
+            store.update(
+                {
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                    "api_key": "from-file-1111",
+                }
+            )
+
+            os.environ["NOVEL_API_KEY_DEFAULT"] = "from-environment-2222"
+            try:
+                public = store.registry_public()["models"][0]
+                self.assertEqual("****2222", public["api_key_hint"])
+                self.assertEqual("env", public["api_key_source"])
+                self.assertEqual(
+                    "from-environment-2222", store.create_client().api_key
+                )
+                # 调用方显式传入的密钥优先于环境变量，便于测试未保存的配置。
+                override = store.create_client({"api_key": "explicit-3333"})
+                self.assertEqual("explicit-3333", override.api_key)
+            finally:
+                del os.environ["NOVEL_API_KEY_DEFAULT"]
+
+    def test_plaintext_key_in_registry_migrates_into_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            local_dir = workspace / ".novel_agents"
+            local_dir.mkdir()
+            (local_dir / "model.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "active_model_id": "default",
+                        "models": [
+                            {
+                                "id": "default",
+                                "display_name": "旧模型",
+                                "base_url": "https://legacy.example/v1",
+                                "model": "legacy-model",
+                                "api_key": "legacy-secret-9999",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = ModelSettingsStore(workspace)
+            public = store.registry_public()["models"][0]
+            self.assertEqual("****9999", public["api_key_hint"])
+
+            migrated = json.loads(
+                (local_dir / "model.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("", migrated["models"][0]["api_key"])
+            self.assertEqual(
+                "NOVEL_API_KEY_DEFAULT", migrated["models"][0]["api_key_env"]
+            )
+            self.assertNotIn("legacy-secret-9999", json.dumps(migrated))
+            self.assertIn(
+                "NOVEL_API_KEY_DEFAULT=legacy-secret-9999",
+                (workspace / ".env").read_text(encoding="utf-8"),
+            )
+            self.assertEqual("legacy-secret-9999", store.create_client().api_key)
 
     def test_model_registry_selects_the_complete_connection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -136,6 +237,83 @@ class LocalConfigurationTests(unittest.TestCase):
 
             self.assertEqual("reserved", agent["runtime_status"])
             self.assertFalse(agent["required"])
+
+
+class JobManagerConcurrencyTests(unittest.TestCase):
+    """回归：终态与并发占用的发布顺序。
+
+    客户端（包括“轮询到 completed 就立刻提交下一步”的串联流程）过去会偶发撞上
+    409，因为任务先被标成 completed，占用却要等 _persist 之后才归还。
+    """
+
+    def test_slot_is_released_before_completion_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = JobManager(
+                max_workers=1,
+                default_project_limit=1,
+                history_path=Path(temp_dir) / "job_history.json",
+            )
+            persist_entered = threading.Event()
+            unblock_persist = threading.Event()
+            original_persist = manager._persist
+
+            def blocking_persist(record) -> None:
+                persist_entered.set()
+                unblock_persist.wait(timeout=10)
+                original_persist(record)
+
+            manager._persist = blocking_persist
+            try:
+                first = manager.submit("p1", "first", lambda record: "done")
+                self.assertTrue(
+                    persist_entered.wait(timeout=10), "首个任务没有走到持久化"
+                )
+                # 持久化仍被卡住，但终态已经可见……
+                self.assertEqual("completed", manager.get(first["id"])["status"])
+                # ……此刻占用必须已经归还，否则同一项目的下一步会被假 409 拒绝。
+                self.assertEqual({}, manager.active_counts)
+                follow_up = manager.submit("p1", "second", lambda record: "again")
+                self.assertEqual("queued", follow_up["status"])
+            finally:
+                unblock_persist.set()
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_failed_job_releases_exclusive_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = JobManager(
+                max_workers=1,
+                default_project_limit=1,
+                history_path=Path(temp_dir) / "job_history.json",
+            )
+
+            def boom(record) -> str:
+                raise RuntimeError("boom")
+
+            job = manager.submit(
+                "p1",
+                "rebuild",
+                boom,
+                exclusive=True,
+                resource_key="p1:memory-rebuild",
+            )
+            self._wait_for_terminal(manager, job["id"])
+            # 占用释放先于终态发布，所以看到终态就说明占用已经归还。
+            self.assertEqual("failed", manager.get(job["id"])["status"])
+            self.assertEqual({}, manager.active_counts)
+            self.assertEqual(set(), manager.exclusive_projects)
+            self.assertEqual(set(), manager.active_resources)
+            # 失败之后同一资源可以立刻重试，不会被残留占用挡住。
+            retry = manager.submit("p1", "rebuild", lambda record: "ok")
+            self.assertEqual("queued", retry["status"])
+            manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def _wait_for_terminal(self, manager: JobManager, job_id: str) -> None:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if manager.get(job_id)["status"] in {"completed", "failed"}:
+                return
+            time.sleep(0.01)
+        self.fail("任务等待超时")
 
 
 class HttpApplicationTests(unittest.TestCase):

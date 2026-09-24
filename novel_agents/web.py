@@ -31,7 +31,7 @@ from .prompt_store import PromptStore
 from .relationship_agents import RelationshipAuditor, RelationshipMemoryAgent
 from .relationship_store import RelationshipStateStore
 from .runtime import RuntimeCoordinator
-from .settings import ModelSettingsStore
+from .settings import ModelSettingsStore, load_workspace_env
 from .style_agents import StyleAuditor, StyleEditor
 from .style_review import StyleReviewService, StyleReviewSettingsStore
 from .vector_index import NumpyVectorIndex
@@ -179,29 +179,36 @@ class JobManager:
         with self.lock:
             record.status = "running"
             record.started_at = _now()
+        status = "completed"
+        detail = ""
+        error = ""
         try:
             detail = work(record)
-            with self.lock:
-                record.status = "completed"
-                record.detail = detail
-                record.completed_at = _now()
         except Exception as exc:
-            with self.lock:
-                record.status = "failed"
-                record.error = str(exc)
-                record.completed_at = _now()
-        finally:
-            self._persist(record)
-            with self.lock:
-                count = self.active_counts.get(record.project_id, 0) - 1
-                if count <= 0:
-                    self.active_counts.pop(record.project_id, None)
-                else:
-                    self.active_counts[record.project_id] = count
-                if record.exclusive:
-                    self.exclusive_projects.discard(record.project_id)
-                if record.resource_key:
-                    self.active_resources.discard(record.resource_key)
+            status = "failed"
+            error = str(exc)
+        # 先释放占用，再发布终态：客户端（以及正文质检这类“轮询到完成就立刻提交
+        # 下一步”的串联流程）一旦看到 completed 就可能马上提交同一项目的新任务，
+        # 若此时占用尚未归还，就会撞上一个假的 409。
+        self._release_slot(record)
+        with self.lock:
+            record.status = status
+            record.detail = detail
+            record.error = error
+            record.completed_at = _now()
+        self._persist(record)
+
+    def _release_slot(self, record: JobRecord) -> None:
+        with self.lock:
+            count = self.active_counts.get(record.project_id, 0) - 1
+            if count <= 0:
+                self.active_counts.pop(record.project_id, None)
+            else:
+                self.active_counts[record.project_id] = count
+            if record.exclusive:
+                self.exclusive_projects.discard(record.project_id)
+            if record.resource_key:
+                self.active_resources.discard(record.resource_key)
 
     def _load_history(self) -> list[dict[str, Any]]:
         if self.history_path is None or not self.history_path.is_file():
@@ -1929,6 +1936,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 模型密钥从环境变量读取；<workspace>/.env 只是它的本地文件形式，
+    # 已存在的进程环境变量优先，不会被文件覆盖。
+    load_workspace_env(args.workspace)
     app = AppContext(args.workspace)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     print(f"Novel Agents: http://{args.host}:{server.server_port}")
